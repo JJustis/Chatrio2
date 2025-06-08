@@ -287,6 +287,13 @@ class P2PNode:
         self.message_handlers = {}
         self.register_default_handlers()
         
+        # Password protection system
+        self.group_passwords = {}      # {group_id: hashed_password}
+        self.password_attempts = {}    # {(peer_id, group_id): attempt_count}
+        self.banned_peers = {}         # {(peer_id, group_id): ban_timestamp}
+        self.max_password_attempts = 3
+        self.ban_duration = 300        # 5 minutes in seconds
+        
         # Startup
         self.start_server()
         
@@ -684,6 +691,52 @@ class P2PNode:
         """Register a handler for a specific message type"""
         self.message_handlers[message_type] = handler_func
     
+    
+    def hash_password(self, password):
+        """Hash a password for secure storage"""
+        import hashlib
+        return hashlib.sha256(password.encode('utf-8')).hexdigest()
+    
+    def verify_password(self, password, hashed_password):
+        """Verify a password against its hash"""
+        return self.hash_password(password) == hashed_password
+    
+    def is_peer_banned(self, peer_id, group_id):
+        """Check if a peer is banned from a group"""
+        ban_key = (peer_id, group_id)
+        if ban_key in self.banned_peers:
+            ban_time = self.banned_peers[ban_key]
+            if time.time() - ban_time < self.ban_duration:
+                return True
+            else:
+                # Ban expired, remove it
+                del self.banned_peers[ban_key]
+                if ban_key in self.password_attempts:
+                    del self.password_attempts[ban_key]
+        return False
+    
+    def ban_peer_from_group(self, peer_id, group_id):
+        """Ban a peer from a group for failed password attempts"""
+        ban_key = (peer_id, group_id)
+        self.banned_peers[ban_key] = time.time()
+        print(f"Banned peer {peer_id} from group {group_id} for {self.ban_duration} seconds")
+    
+    def increment_password_attempt(self, peer_id, group_id):
+        """Increment password attempt counter and check for ban"""
+        attempt_key = (peer_id, group_id)
+        self.password_attempts[attempt_key] = self.password_attempts.get(attempt_key, 0) + 1
+        
+        if self.password_attempts[attempt_key] >= self.max_password_attempts:
+            self.ban_peer_from_group(peer_id, group_id)
+            return True  # Peer is now banned
+        return False  # Peer is not banned yet
+    
+    def reset_password_attempts(self, peer_id, group_id):
+        """Reset password attempts for a peer on successful authentication"""
+        attempt_key = (peer_id, group_id)
+        if attempt_key in self.password_attempts:
+            del self.password_attempts[attempt_key]
+    
     def register_default_handlers(self):
         """Register default message handlers"""
         self.register_handler('peer_list', self.handle_peer_list)
@@ -692,6 +745,14 @@ class P2PNode:
         self.register_handler('leave_group', self.handle_leave_group)
         self.register_handler('chat_message', self.handle_chat_message)
         self.register_handler('group_info', self.handle_group_info)
+        self.register_handler('request_group_info', self.handle_request_group_info)
+        self.register_handler('group_password_challenge', self.handle_group_password_challenge)
+        self.register_handler('group_password_response', self.handle_group_password_response)
+        self.register_handler('group_access_denied', self.handle_group_access_denied)  # NEW
+        self.register_handler('request_group_info', self.handle_request_group_info)
+        self.register_handler('group_password_challenge', self.handle_group_password_challenge)
+        self.register_handler('group_password_response', self.handle_group_password_response)
+        self.register_handler('group_access_denied', self.handle_group_access_denied)  # NEW
         # File transfer handlers
         self.register_handler('file_chunk', self.handle_file_chunk)
         self.register_handler('file_request', self.handle_file_request)
@@ -710,38 +771,67 @@ class P2PNode:
             self.on_peer_list_received(new_peers)
     
     def handle_create_group(self, peer_id, data):
-        """Handle group creation message"""
+        """Handle group creation message with password support"""
         group_id = data.get('group_id')
         group_name = data.get('group_name')
         creator_id = data.get('creator_id')
+        has_password = data.get('has_password', False)
         
         if group_id not in self.groups:
+            # Create the group record
             self.groups[group_id] = {
                 'name': group_name,
                 'creator_id': creator_id,
-                'members': {creator_id},
-                'messages': []
+                'members': {creator_id},  # Only creator initially
+                'messages': [],
+                'has_password': has_password
             }
             
-            # If we're in a UI context, notify
+            # If group has password, send challenge instead of auto-joining
+            if has_password:
+                challenge_id = str(uuid.uuid4())
+                self.send_to_peer(peer_id, {
+                    'type': 'group_password_challenge',
+                    'group_id': group_id,
+                    'group_name': group_name,
+                    'challenge_id': challenge_id
+                })
+            else:
+                # No password - auto-join and confirm
+                self.groups[group_id]['members'].add(self.node_id)
+                
+                self.send_to_peer(peer_id, {
+                    'type': 'join_group',
+                    'group_id': group_id,
+                    'member_id': self.node_id
+                })
+            
+            # Notify UI about new group
             if hasattr(self, 'on_group_created'):
                 self.on_group_created(group_id, group_name, creator_id)
     
     def handle_join_group(self, peer_id, data):
-        """Handle someone joining a group"""
+        """Handle someone joining a group - FIXED VERSION"""
         group_id = data.get('group_id')
         member_id = data.get('member_id')
         
         if group_id in self.groups:
+            # Add the member
             self.groups[group_id]['members'].add(member_id)
             
             # If we're in a UI context, notify
             if hasattr(self, 'on_group_member_joined'):
                 self.on_group_member_joined(group_id, member_id)
             
-            # If this is a new member, share group history
+            # Share group history with the new member (only if we're not the one joining)
             if member_id != self.node_id:
-                self.share_group_history(group_id, member_id)
+                self.share_group_history(group_id, peer_id)
+                
+            # Broadcast the join to other members
+            for other_peer_id in self.peer_connections:
+                if (other_peer_id != peer_id and other_peer_id != member_id and
+                    other_peer_id in self.groups[group_id]['members']):
+                    self.send_to_peer(other_peer_id, data)
     
     def handle_leave_group(self, peer_id, data):
         """Handle someone leaving a group"""
@@ -756,7 +846,7 @@ class P2PNode:
                 self.on_group_member_left(group_id, member_id)
     
     def handle_chat_message(self, peer_id, data):
-        """Handle a chat message"""
+        """Handle a chat message - FIXED VERSION"""
         group_id = data.get('group_id')
         message_id = data.get('message_id')
         sender_id = data.get('sender_id')
@@ -764,38 +854,58 @@ class P2PNode:
         timestamp = data.get('timestamp')
         obfuscated = data.get('obfuscated', False)
         
-        if group_id in self.groups:
-            # Store message
-            message = {
-                'message_id': message_id,
-                'group_id': group_id,
-                'sender_id': sender_id,
-                'content': content,
-                'timestamp': timestamp,
-                'obfuscated': obfuscated
+        # Check if we're a member of this group OR if we should auto-join
+        if group_id not in self.groups:
+            # Auto-join the group if we receive a message for it
+            # This handles the case where someone sends a message before we properly joined
+            self.groups[group_id] = {
+                'name': f"Group-{group_id[:8]}",  # Temporary name
+                'creator_id': sender_id,
+                'members': {sender_id, self.node_id},
+                'messages': []
             }
             
-            # Add to group's message list
-            self.groups[group_id]['messages'].append(message)
+            # Request group info to get the proper name
+            self.send_to_peer(peer_id, {
+                'type': 'request_group_info',
+                'group_id': group_id
+            })
             
-            # Cache message
-            self.message_cache[message_id] = message
+            # Notify UI about new group
+            if hasattr(self, 'on_group_created'):
+                self.on_group_created(group_id, self.groups[group_id]['name'], sender_id)
+        
+        # Only process if we're a member or if it's from a direct peer
+        if (self.node_id in self.groups[group_id]['members'] or 
+            sender_id in self.peer_connections or 
+            peer_id in self.peer_connections):
             
-            # If we're in a UI context, notify
-            if hasattr(self, 'on_chat_message_received'):
-                self.on_chat_message_received(group_id, message)
+            # Store message if we don't have it
+            if message_id not in self.message_cache:
+                message = {
+                    'message_id': message_id,
+                    'group_id': group_id,
+                    'sender_id': sender_id,
+                    'content': content,
+                    'timestamp': timestamp,
+                    'obfuscated': obfuscated
+                }
+                
+                # Add to group's message list
+                self.groups[group_id]['messages'].append(message)
+                
+                # Cache message
+                self.message_cache[message_id] = message
+                
+                # If we're in a UI context, notify
+                if hasattr(self, 'on_chat_message_received'):
+                    self.on_chat_message_received(group_id, message)
             
-            # Forward to other peers who are in this group
-            # but might not have received it yet
-            forwarded = False
+            # Forward to other peers who might be in this group
+            # but exclude the sender and the peer we got it from
             for other_peer_id in self.peer_connections:
-                if (other_peer_id != peer_id and other_peer_id != sender_id and
-                    other_peer_id in self.groups[group_id]['members']):
+                if other_peer_id != peer_id and other_peer_id != sender_id:
                     self.queue_message_to_peer(other_peer_id, data)
-                    forwarded = True
-            
-            if forwarded:
-                print(f"Forwarded message {message_id} to other group members")
     
     def handle_group_info(self, peer_id, data):
         """Handle group info message"""
@@ -831,8 +941,206 @@ class P2PNode:
             self.on_group_info_received(group_id, group_name, members)
     
     # File transfer handlers
+    
+    
+    def handle_request_group_info(self, peer_id, data):
+        """Handle a request for group information"""
+        group_id = data.get('group_id')
+        
+        if group_id in self.groups:
+            group = self.groups[group_id]
+            
+            # Send group info back
+            self.send_to_peer(peer_id, {
+                'type': 'group_info',
+                'group_id': group_id,
+                'group_name': group['name'],
+                'members': list(group['members']),
+                'messages': group['messages'][-50:]  # Last 50 messages
+            })
+    
+    
+    
+    def handle_group_password_challenge(self, peer_id, data):
+        """Handle a password challenge for group access"""
+        group_id = data.get('group_id')
+        challenge_id = data.get('challenge_id')
+        
+        # If we have a UI, prompt for password
+        if hasattr(self, 'on_password_challenge_received'):
+            self.on_password_challenge_received(peer_id, group_id, challenge_id)
+    
+    def handle_group_password_response(self, peer_id, data):
+        """Handle a password response from a peer"""
+        group_id = data.get('group_id')
+        challenge_id = data.get('challenge_id')
+        password = data.get('password')
+        
+        # Check if peer is banned
+        if self.is_peer_banned(peer_id, group_id):
+            remaining_time = self.ban_duration - (time.time() - self.banned_peers[(peer_id, group_id)])
+            self.send_to_peer(peer_id, {
+                'type': 'group_access_denied',
+                'group_id': group_id,
+                'reason': 'banned',
+                'remaining_time': int(remaining_time)
+            })
+            return
+        
+        # Verify password
+        if group_id in self.group_passwords:
+            if self.verify_password(password, self.group_passwords[group_id]):
+                # Password correct - reset attempts and allow access
+                self.reset_password_attempts(peer_id, group_id)
+                
+                # Add peer to group
+                if group_id in self.groups:
+                    self.groups[group_id]['members'].add(peer_id)
+                
+                # Send group info
+                self.send_to_peer(peer_id, {
+                    'type': 'group_info',
+                    'group_id': group_id,
+                    'group_name': self.groups[group_id]['name'],
+                    'members': list(self.groups[group_id]['members']),
+                    'messages': self.groups[group_id]['messages'][-50:]
+                })
+                
+                # Notify other members
+                self.broadcast_to_peers({
+                    'type': 'join_group',
+                    'group_id': group_id,
+                    'member_id': peer_id
+                }, exclude_peer_id=peer_id)
+                
+            else:
+                # Password incorrect
+                is_banned = self.increment_password_attempt(peer_id, group_id)
+                
+                if is_banned:
+                    self.send_to_peer(peer_id, {
+                        'type': 'group_access_denied',
+                        'group_id': group_id,
+                        'reason': 'banned',
+                        'remaining_time': self.ban_duration
+                    })
+                else:
+                    attempts_left = self.max_password_attempts - self.password_attempts.get((peer_id, group_id), 0)
+                    self.send_to_peer(peer_id, {
+                        'type': 'group_access_denied',
+                        'group_id': group_id,
+                        'reason': 'wrong_password',
+                        'attempts_left': attempts_left
+                    })
+    
+    def handle_group_access_denied(self, peer_id, data):
+        """Handle group access denial notification"""
+        group_id = data.get('group_id')
+        reason = data.get('reason')
+        
+        if hasattr(self, 'on_group_access_denied'):
+            self.on_group_access_denied(group_id, reason, data)
+    
+    def handle_request_group_info(self, peer_id, data):
+        """Handle a request for group information"""
+        group_id = data.get('group_id')
+        
+        if group_id in self.groups:
+            group = self.groups[group_id]
+            
+            # Send group info back
+            self.send_to_peer(peer_id, {
+                'type': 'group_info',
+                'group_id': group_id,
+                'group_name': group['name'],
+                'members': list(group['members']),
+                'messages': group['messages'][-50:]  # Last 50 messages
+            })
+    
+    
+    
+    def handle_group_password_challenge(self, peer_id, data):
+        """Handle a password challenge for group access"""
+        group_id = data.get('group_id')
+        challenge_id = data.get('challenge_id')
+        
+        # If we have a UI, prompt for password
+        if hasattr(self, 'on_password_challenge_received'):
+            self.on_password_challenge_received(peer_id, group_id, challenge_id)
+    
+    def handle_group_password_response(self, peer_id, data):
+        """Handle a password response from a peer"""
+        group_id = data.get('group_id')
+        challenge_id = data.get('challenge_id')
+        password = data.get('password')
+        
+        # Check if peer is banned
+        if self.is_peer_banned(peer_id, group_id):
+            remaining_time = self.ban_duration - (time.time() - self.banned_peers[(peer_id, group_id)])
+            self.send_to_peer(peer_id, {
+                'type': 'group_access_denied',
+                'group_id': group_id,
+                'reason': 'banned',
+                'remaining_time': int(remaining_time)
+            })
+            return
+        
+        # Verify password
+        if group_id in self.group_passwords:
+            if self.verify_password(password, self.group_passwords[group_id]):
+                # Password correct - reset attempts and allow access
+                self.reset_password_attempts(peer_id, group_id)
+                
+                # Add peer to group
+                if group_id in self.groups:
+                    self.groups[group_id]['members'].add(peer_id)
+                
+                # Send group info
+                self.send_to_peer(peer_id, {
+                    'type': 'group_info',
+                    'group_id': group_id,
+                    'group_name': self.groups[group_id]['name'],
+                    'members': list(self.groups[group_id]['members']),
+                    'messages': self.groups[group_id]['messages'][-50:]
+                })
+                
+                # Notify other members
+                self.broadcast_to_peers({
+                    'type': 'join_group',
+                    'group_id': group_id,
+                    'member_id': peer_id
+                }, exclude_peer_id=peer_id)
+                
+            else:
+                # Password incorrect
+                is_banned = self.increment_password_attempt(peer_id, group_id)
+                
+                if is_banned:
+                    self.send_to_peer(peer_id, {
+                        'type': 'group_access_denied',
+                        'group_id': group_id,
+                        'reason': 'banned',
+                        'remaining_time': self.ban_duration
+                    })
+                else:
+                    attempts_left = self.max_password_attempts - self.password_attempts.get((peer_id, group_id), 0)
+                    self.send_to_peer(peer_id, {
+                        'type': 'group_access_denied',
+                        'group_id': group_id,
+                        'reason': 'wrong_password',
+                        'attempts_left': attempts_left
+                    })
+    
+    def handle_group_access_denied(self, peer_id, data):
+        """Handle group access denial notification"""
+        group_id = data.get('group_id')
+        reason = data.get('reason')
+        
+        if hasattr(self, 'on_group_access_denied'):
+            self.on_group_access_denied(group_id, reason, data)
+    
     def handle_file_request(self, peer_id, data):
-        """Handle a request for a file chunk"""
+        """Handle a request for a file chunk - FIXED VERSION"""
         transfer_id = data.get('transfer_id')
         chunk_index = data.get('chunk_index')
         
@@ -843,17 +1151,24 @@ class P2PNode:
             if chunk_index < len(transfer['chunks']):
                 chunk_data = transfer['chunks'][chunk_index]
                 
-                # Send the chunk
-                self.send_to_peer(peer_id, {
+                # Send the chunk with file info for first chunk
+                response_data = {
                     'type': 'file_chunk',
                     'transfer_id': transfer_id,
                     'chunk_index': chunk_index,
                     'total_chunks': len(transfer['chunks']),
                     'chunk_data': chunk_data
-                })
+                }
+                
+                # Include file info and group info for first chunk
+                if chunk_index == 0:
+                    response_data['file_info'] = transfer.get('file_info', {})
+                    response_data['group_id'] = transfer.get('group_id')
+                
+                self.send_to_peer(peer_id, response_data)
     
     def handle_file_chunk(self, peer_id, data):
-        """Handle receiving a file chunk"""
+        """Handle receiving a file chunk - FIXED VERSION"""
         transfer_id = data.get('transfer_id')
         chunk_index = data.get('chunk_index')
         total_chunks = data.get('total_chunks')
@@ -869,11 +1184,21 @@ class P2PNode:
                 'group_id': data.get('group_id'),
                 'sender_id': peer_id
             }
+            
+            # Notify UI about new transfer
+            file_info = data.get('file_info', {})
+            if hasattr(self, 'on_file_transfer_created'):
+                self.on_file_transfer_created(
+                    transfer_id, 
+                    file_info.get('filename', 'Unknown'), 
+                    file_info.get('file_type', ''), 
+                    file_info.get('file_size', 0)
+                )
         
         transfer = self.file_transfers[transfer_id]
         
-        # Store the chunk
-        if transfer['chunks'][chunk_index] is None:
+        # Store the chunk if we don't have it
+        if chunk_index < len(transfer['chunks']) and transfer['chunks'][chunk_index] is None:
             transfer['chunks'][chunk_index] = chunk_data
             transfer['received_chunks'] += 1
             
@@ -882,8 +1207,20 @@ class P2PNode:
                 progress = transfer['received_chunks'] / transfer['total_chunks']
                 self.on_file_progress(transfer_id, progress)
             
-            # Check if the file is complete
-            if transfer['received_chunks'] == transfer['total_chunks']:
+            # Request next chunk if we need it
+            if transfer['received_chunks'] < transfer['total_chunks']:
+                # Find next missing chunk
+                for i, chunk in enumerate(transfer['chunks']):
+                    if chunk is None:
+                        # Request this chunk
+                        self.send_to_peer(peer_id, {
+                            'type': 'file_request',
+                            'transfer_id': transfer_id,
+                            'chunk_index': i
+                        })
+                        break
+            else:
+                # File is complete
                 self.complete_file_transfer(transfer_id)
     
     def handle_file_complete(self, peer_id, data):
@@ -962,27 +1299,33 @@ class P2PNode:
                 # Notify UI
                 self.on_chat_message_received(group_id, message)
     
-    def create_group(self, group_name):
-        """Create a new group"""
+    def create_group(self, group_name, password=None):
+        """Create a new group with optional password protection"""
         group_id = str(uuid.uuid4())
         
-        # Store group locally
+        # Store group locally with just ourselves initially
         self.groups[group_id] = {
             'name': group_name,
             'creator_id': self.node_id,
             'members': {self.node_id},
-            'messages': []
+            'messages': [],
+            'has_password': password is not None
         }
+        
+        # Store password if provided
+        if password:
+            self.group_passwords[group_id] = self.hash_password(password)
         
         # Broadcast to all peers
         self.broadcast_to_peers({
             'type': 'create_group',
             'group_id': group_id,
             'group_name': group_name,
-            'creator_id': self.node_id
+            'creator_id': self.node_id,
+            'has_password': password is not None
         })
         
-        print(f"Created group {group_name} ({group_id})")
+        print(f"Created group {group_name} ({group_id})" + (" with password protection" if password else ""))
         
         # Notify UI if we have a handler
         if hasattr(self, 'on_group_created'):
@@ -1030,7 +1373,7 @@ class P2PNode:
         return True
     
     def send_chat_message(self, group_id, content, obfuscated=False):
-        """Send a chat message to a group"""
+        """Send a chat message to a group - FIXED VERSION"""
         if group_id not in self.groups:
             return False
         
@@ -1055,10 +1398,10 @@ class P2PNode:
         self.groups[group_id]['messages'].append(message)
         self.message_cache[message_id] = message
         
-        # Send to all peers in the group
+        # Send to ALL connected peers (they will filter based on group membership)
+        # This ensures the message reaches everyone who should see it
         for peer_id in self.peer_connections:
-            if peer_id in self.groups[group_id]['members']:
-                self.queue_message_to_peer(peer_id, message)
+            self.queue_message_to_peer(peer_id, message)
         
         # Notify UI if we have a handler
         if hasattr(self, 'on_chat_message_received'):
@@ -1067,7 +1410,7 @@ class P2PNode:
         return True
     
     def send_file(self, group_id, file_path):
-        """Send a file to a group"""
+        """Send a file to a group - FIXED VERSION"""
         if group_id not in self.groups:
             return False, "Group not found"
         
@@ -1107,6 +1450,7 @@ class P2PNode:
                     'file_type': file_type,
                     'file_size': file_size,
                     'message_id': message_id,
+                    'data': file_data  # Store the actual file data for sender
                 },
                 'group_id': group_id,
                 'sender_id': self.node_id,
@@ -1138,24 +1482,9 @@ class P2PNode:
             if hasattr(self, 'on_file_transfer_created'):
                 self.on_file_transfer_created(transfer_id, filename, file_type, file_size)
             
-            # Send first chunk to each peer in the group
+            # Send to ALL connected peers (they will auto-request chunks if interested)
             for peer_id in self.peer_connections:
-                if peer_id in self.groups[group_id]['members']:
-                    # Send initial message with file info
-                    self.send_to_peer(peer_id, {
-                        'type': 'file_chunk',
-                        'transfer_id': transfer_id,
-                        'chunk_index': 0,
-                        'total_chunks': len(chunks),
-                        'chunk_data': chunks[0],
-                        'file_info': {
-                            'filename': filename,
-                            'file_type': file_type,
-                            'file_size': file_size,
-                            'message_id': message_id,
-                        },
-                        'group_id': group_id
-                    })
+                self.queue_message_to_peer(peer_id, message)
             
             return True, transfer_id
             
@@ -1259,7 +1588,7 @@ class ModernChatApp:
     
     def __init__(self, master):
         self.master = master
-        self.master.title("Enhanced P2P Group Chat")
+        self.master.title("🔒 Enhanced P2P Chat - Secure & Private")
         self.master.geometry("1000x700")
         self.master.minsize(800, 600)
         self.master.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -1331,15 +1660,19 @@ class ModernChatApp:
         
         # Set application colors
         self.colors = {
-            "bg": "#f0f0f0",
-            "chat_bg": "#ffffff",
-            "self_msg": "#e1f2ff",
-            "other_msg": "#f0f0f0",
-            "system_msg": "#f5f5f5",
-            "security_color": "#008800",
-            "accent": "#0078d7",
+            "bg": "#E6F3FF",
+            "chat_bg": "#FFFFFF",
+            "self_msg": "#DCF8C6",
+            "other_msg": "#E7E7E7",
+            "system_msg": "#F0F8FF",
+            "security_color": "#4CAF50",
+            "accent": "#0078D4",
             "obfuscated_bg": "#333333",
-            "obfuscated_fg": "#999999"
+            "obfuscated_fg": "#999999",
+            "skype_blue": "#00AFF0",
+            "skype_blue_dark": "#0078D4",
+            "header_bg": "#4A90E2",
+            "sidebar_bg": "#F7F7F7"
         }
         
     def load_resources(self):
@@ -1740,6 +2073,8 @@ class ModernChatApp:
         self.node.on_file_progress = self.on_file_progress
         self.node.on_file_received = self.on_file_received
         self.node.on_file_delivered = self.on_file_delivered
+        self.node.on_password_challenge_received = self.on_password_challenge_received
+        self.node.on_group_access_denied = self.on_group_access_denied
         
         # Update UI
         self.username = username
@@ -1836,17 +2171,185 @@ class ModernChatApp:
         except Exception as e:
             self.master.after(0, lambda: messagebox.showerror("Connection Error", str(e)))
     
+    
+    def create_group_with_password_dialog(self):
+        """Show dialog to create group with optional password"""
+        dialog = tk.Toplevel(self.master)
+        dialog.title("Create New Group")
+        dialog.geometry("500x450")
+        dialog.resizable(False, False)
+        dialog.transient(self.master)
+        dialog.grab_set()
+        
+        # Center the dialog
+        dialog.geometry("+%d+%d" % (self.master.winfo_rootx() + 50, self.master.winfo_rooty() + 50))
+        
+        # Content frame
+        content_frame = tk.Frame(dialog, bg="#E6F3FF", padx=20, pady=20)
+        content_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Title
+        title_label = tk.Label(content_frame, text="Create New Group", 
+                              font=("Segoe UI", 14, "bold"), bg="#F0F0F0")
+        title_label.pack(pady=(0, 20))
+        
+        # Group name
+        tk.Label(content_frame, text="Group Name:", font=("Segoe UI", 10), bg="#F0F0F0").pack(anchor=tk.W)
+        name_var = tk.StringVar()
+        name_entry = tk.Entry(content_frame, textvariable=name_var, font=("Segoe UI", 10), width=30)
+        name_entry.pack(fill=tk.X, pady=(5, 15))
+        name_entry.focus()
+        
+        # Password protection checkbox
+        password_enabled = tk.BooleanVar()
+        password_check = tk.Checkbutton(content_frame, text="🔒 Password protect this group", 
+                                       variable=password_enabled, font=("Segoe UI", 10),
+                                       bg="#F0F0F0", command=lambda: self.toggle_password_fields(password_enabled.get(), password_frame))
+        password_check.pack(anchor=tk.W, pady=(0, 10))
+        
+        # Password fields (initially hidden)
+        password_frame = tk.Frame(content_frame, bg="#F0F0F0")
+        password_frame.pack(fill=tk.X, pady=(0, 15))
+        
+        tk.Label(password_frame, text="Password:", font=("Segoe UI", 10), bg="#F0F0F0").pack(anchor=tk.W)
+        password_var = tk.StringVar()
+        password_entry = tk.Entry(password_frame, textvariable=password_var, show="•", 
+                                 font=("Segoe UI", 10), width=30)
+        password_entry.pack(fill=tk.X, pady=(5, 10))
+        
+        tk.Label(password_frame, text="Confirm Password:", font=("Segoe UI", 10), bg="#F0F0F0").pack(anchor=tk.W)
+        confirm_var = tk.StringVar()
+        confirm_entry = tk.Entry(password_frame, textvariable=confirm_var, show="•", 
+                                font=("Segoe UI", 10), width=30)
+        confirm_entry.pack(fill=tk.X, pady=(5, 0))
+        
+        # Initially hide password fields
+        password_frame.pack_forget()
+        
+        # Buttons
+        button_frame = tk.Frame(content_frame, bg="#F0F0F0")
+        button_frame.pack(fill=tk.X, pady=(10, 0))
+        
+        def create_group():
+            group_name = name_var.get().strip()
+            if not group_name:
+                tk.messagebox.showerror("Error", "Group name is required")
+                return
+            
+            password = None
+            if password_enabled.get():
+                password = password_var.get()
+                confirm = confirm_var.get()
+                
+                if not password:
+                    tk.messagebox.showerror("Error", "Password is required when protection is enabled")
+                    return
+                
+                if password.strip() != confirm.strip():
+                    tk.messagebox.showerror("Error", "Passwords do not match", parent=dialog)
+                    return
+                
+                if len(password) < 4:
+                    tk.messagebox.showerror("Error", "Password must be at least 4 characters")
+                    return
+            
+            # Create the group
+            group_id = self.node.create_group(group_name, password)
+            self.select_group(group_id)
+            dialog.destroy()
+        
+        tk.Button(button_frame, text="Cancel", command=dialog.destroy,
+                 bg="#6C757D", fg="white", font=("Segoe UI", 10), padx=15).pack(side=tk.RIGHT, padx=(5, 0))
+        
+        tk.Button(button_frame, text="Create Group", command=create_group,
+                 bg="#007BFF", fg="white", font=("Segoe UI", 10, "bold"), padx=15).pack(side=tk.RIGHT)
+        
+        # Bind Enter key
+        def on_enter(event):
+            create_group()
+        
+        dialog.bind('<Return>', on_enter)
+        
+        return dialog
+    
+    def toggle_password_fields(self, enabled, password_frame):
+        """Show or hide password fields based on checkbox"""
+        if enabled:
+            password_frame.pack(fill=tk.X, pady=(10, 15))
+            # Focus on the first password field
+            for widget in password_frame.winfo_children():
+                if isinstance(widget, tk.Entry):
+                    widget.focus()
+                    break
+        else:
+            password_frame.pack_forget()
+    
+    def show_password_challenge_dialog(self, peer_id, group_id, group_name, challenge_id):
+        """Show password input dialog for joining a protected group"""
+        dialog = tk.Toplevel(self.master)
+        dialog.title("Group Password Required")
+        dialog.geometry("400x250")
+        dialog.resizable(False, False)
+        dialog.transient(self.master)
+        dialog.grab_set()
+        
+        # Center the dialog
+        dialog.geometry("+%d+%d" % (self.master.winfo_rootx() + 100, self.master.winfo_rooty() + 100))
+        
+        # Content frame
+        content_frame = tk.Frame(dialog, bg="#E6F3FF", padx=20, pady=20)
+        content_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Icon and title
+        tk.Label(content_frame, text="🔒", font=("Segoe UI", 24), bg="#F0F0F0").pack(pady=(0, 10))
+        tk.Label(content_frame, text=f"Password Required", 
+                font=("Segoe UI", 12, "bold"), bg="#F0F0F0").pack()
+        tk.Label(content_frame, text=f"Group: {group_name}", 
+                font=("Segoe UI", 10), bg="#F0F0F0", fg="#666").pack(pady=(5, 15))
+        
+        # Password input
+        tk.Label(content_frame, text="Enter password:", font=("Segoe UI", 10), bg="#F0F0F0").pack(anchor=tk.W)
+        password_var = tk.StringVar()
+        password_entry = tk.Entry(content_frame, textvariable=password_var, show="•", 
+                                 font=("Segoe UI", 10), width=25)
+        password_entry.pack(fill=tk.X, pady=(5, 15))
+        password_entry.focus()
+        
+        # Buttons
+        button_frame = tk.Frame(content_frame, bg="#F0F0F0")
+        button_frame.pack(fill=tk.X)
+        
+        def submit_password():
+            password = password_var.get()
+            if not password:
+                tk.messagebox.showerror("Error", "Password is required")
+                return
+            
+            # Send password response
+            self.node.send_to_peer(peer_id, {
+                'type': 'group_password_response',
+                'group_id': group_id,
+                'challenge_id': challenge_id,
+                'password': password
+            })
+            
+            dialog.destroy()
+        
+        tk.Button(button_frame, text="Cancel", command=dialog.destroy,
+                 bg="#6C757D", fg="white", font=("Segoe UI", 9), padx=12).pack(side=tk.RIGHT, padx=(5, 0))
+        
+        tk.Button(button_frame, text="Join Group", command=submit_password,
+                 bg="#28A745", fg="white", font=("Segoe UI", 9, "bold"), padx=12).pack(side=tk.RIGHT)
+        
+        # Bind Enter key
+        dialog.bind('<Return>', lambda e: submit_password())
+    
     def create_group(self):
-        """Create a new group"""
+        """Create a new group with password dialog"""
         if self.node is None:
             return
         
-        group_name = simpledialog.askstring("Create Group", "Enter group name:", parent=self.master)
-        if not group_name:
-            return
-        
-        group_id = self.node.create_group(group_name)
-        self.select_group(group_id)
+        self.create_group_with_password_dialog()
     
     def leave_group(self):
         """Leave the current group"""
@@ -2689,7 +3192,11 @@ class ModernChatApp:
             self.master.after(0, lambda: self.add_system_message(f"{username} left the group"))
     
     def on_chat_message_received(self, group_id, message):
-        """Called when a chat message is received"""
+        """Called when a chat message is received - FIXED VERSION"""
+        # Add to groups list if not already there
+        if group_id not in self.group_frames:
+            self.master.after(0, lambda: self.add_group_to_list(group_id))
+        
         # Add message to UI if we're in this group
         if self.current_group == group_id:
             sender_id = message.get('sender_id')
@@ -2718,11 +3225,11 @@ class ModernChatApp:
                 self.master.after(0, lambda: self.chat_text.config(state=tk.NORMAL))
                 if timestamp:
                     time_str = time.strftime("%H:%M:%S", time.localtime(timestamp))
-                    self.master.after(0, lambda: self.chat_text.insert(tk.END, f"\n[{time_str}] ", "timestamp"))
+                    self.master.after(0, lambda ts=time_str: self.chat_text.insert(tk.END, "\\n[" + ts + "] ", "timestamp"))
                 
                 # Add sender name
                 tag = "self" if sender_id == self.node.node_id else "other"
-                self.master.after(0, lambda: self.chat_text.insert(tk.END, f"{sender_name} shared a file:\n", tag))
+                self.master.after(0, lambda sn=sender_name, t=tag: self.chat_text.insert(tk.END, sn + " shared a file:", t))
                 self.master.after(0, lambda: self.chat_text.config(state=tk.DISABLED))
                 
                 # If we have the file data, display it
@@ -2731,9 +3238,10 @@ class ModernChatApp:
                     if 'data' in file_info:
                         self.master.after(0, lambda: self.display_file(file_info, tag=tag))
                     else:
-                        # Request the file if we don't have it
-                        self.master.after(0, lambda: self.node.request_file_chunk(file_transfer_id, 0))
-                else:
+                        # Request the file if we don't have it and we're not the sender
+                        if sender_id != self.node.node_id:
+                            self.master.after(0, lambda: self.node.request_file_chunk(file_transfer_id, 0))
+                elif sender_id != self.node.node_id:
                     # Create a transfer record and request the file
                     transfer = {
                         'file_info': {
@@ -2809,6 +3317,29 @@ class ModernChatApp:
                 delivered_label = ttk.Label(transfer_frame, text=f"Delivered to {username}", foreground="green")
                 delivered_label.pack(side=tk.BOTTOM, fill=tk.X)
     
+    
+    def on_password_challenge_received(self, peer_id, group_id, challenge_id):
+        """Called when a password challenge is received"""
+        if group_id in self.node.groups:
+            group_name = self.node.groups[group_id]['name']
+            self.master.after(0, lambda: self.show_password_challenge_dialog(peer_id, group_id, group_name, challenge_id))
+    
+    def on_group_access_denied(self, group_id, reason, data):
+        """Called when group access is denied"""
+        if reason == 'wrong_password':
+            attempts_left = data.get('attempts_left', 0)
+            self.master.after(0, lambda: tk.messagebox.showerror(
+                "Access Denied", 
+                f"Incorrect password. {attempts_left} attempts remaining."
+            ))
+        elif reason == 'banned':
+            remaining_time = data.get('remaining_time', 0)
+            minutes = remaining_time // 60
+            seconds = remaining_time % 60
+            self.master.after(0, lambda: tk.messagebox.showerror(
+                "Access Denied", 
+                f"You have been banned from this group.Time remaining: {minutes}m {seconds}s"
+            ))
     def on_close(self):
         """Handle window close event"""
         if self.node is not None:
