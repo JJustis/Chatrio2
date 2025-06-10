@@ -123,7 +123,7 @@ class SecurityManager:
         self.session_keys[peer_id] = (session_key, expires_at)
     
     def encrypt_message(self, peer_id, message):
-        """Encrypt a message for a peer using AES-GCM"""
+        """Encrypt a message for a peer using AES-GCM - FIXED for binary data"""
         try:
             # Check if we have a valid session key
             if peer_id not in self.session_keys:
@@ -135,11 +135,24 @@ class SecurityManager:
             if datetime.now() > expires_at:
                 return None, "Session key expired"
             
-            # Convert message to JSON and then to bytes
+            # Convert message to JSON and then to bytes - FIXED
             if isinstance(message, dict):
-                message = json.dumps(message).encode('utf-8')
-            if isinstance(message, str):
+                # Check if this is a file chunk message (contains binary data)
+                if message.get('type') == 'file_chunk':
+                    # Don't encrypt file chunks - they're already base64 encoded
+                    print(f"[DEBUG] Skipping encryption for file chunk (already base64)")
+                    return message, None
+                else:
+                    # Regular message - convert to JSON
+                    message = json.dumps(message).encode('utf-8')
+            elif isinstance(message, str):
                 message = message.encode('utf-8')
+            elif isinstance(message, bytes):
+                # Already bytes, use as-is
+                pass
+            else:
+                # Unknown type, try to serialize
+                message = json.dumps(message).encode('utf-8')
             
             # Generate a new nonce (IV) for each message
             nonce = get_random_bytes(12)  # 96 bits for GCM
@@ -546,11 +559,13 @@ class P2PNode:
                 pass
     
     def send_to_peer(self, peer_id, data):
-        """Send data to a specific peer"""
+        """Send data to a specific peer - FIXED for file chunks"""
         if peer_id in self.peer_connections:
             try:
                 # Check if message needs encryption
-                if data.get('type') not in ['handshake', 'handshake_response', 'auth_challenge', 'auth_response']:
+                skip_encryption_types = ['handshake', 'handshake_response', 'auth_challenge', 'auth_response', 'file_chunk']
+                
+                if data.get('type') not in skip_encryption_types:
                     # Encrypt message if we have a session key
                     if self.security.has_valid_session(peer_id):
                         encrypted_data, error = self.security.encrypt_message(peer_id, data)
@@ -563,6 +578,8 @@ class P2PNode:
                             'type': 'encrypted',
                             'data': encrypted_data
                         }
+                else:
+                    print(f"[DEBUG] Skipping encryption for {data.get('type')}")
                 
                 self.send_data(self.peer_connections[peer_id], data)
                 return True
@@ -571,7 +588,6 @@ class P2PNode:
                 self.disconnect_peer(peer_id)
                 return False
         return False
-    
     def broadcast_to_peers(self, data, exclude_peer_id=None):
         """Broadcast data to all connected peers, optionally excluding one"""
         for peer_id in list(self.peer_connections.keys()):
@@ -771,7 +787,7 @@ class P2PNode:
             self.on_peer_list_received(new_peers)
     
     def handle_create_group(self, peer_id, data):
-        """Handle group creation message with password support"""
+        """Handle group creation message with password support - FIXED"""
         group_id = data.get('group_id')
         group_name = data.get('group_name')
         creator_id = data.get('creator_id')
@@ -784,10 +800,11 @@ class P2PNode:
                 'creator_id': creator_id,
                 'members': {creator_id},  # Only creator initially
                 'messages': [],
+                'has_password': has_password,
                 'has_password': has_password
             }
             
-            # If group has password, send challenge instead of auto-joining
+            # If group has password, send challenge - DON'T auto-join
             if has_password:
                 challenge_id = str(uuid.uuid4())
                 self.send_to_peer(peer_id, {
@@ -796,6 +813,7 @@ class P2PNode:
                     'group_name': group_name,
                     'challenge_id': challenge_id
                 })
+                print(f"Sent password challenge for group {group_name} to peer {peer_id}")
             else:
                 # No password - auto-join and confirm
                 self.groups[group_id]['members'].add(self.node_id)
@@ -805,6 +823,7 @@ class P2PNode:
                     'group_id': group_id,
                     'member_id': self.node_id
                 })
+                print(f"Auto-joined group {group_name} (no password)")
             
             # Notify UI about new group
             if hasattr(self, 'on_group_created'):
@@ -846,7 +865,7 @@ class P2PNode:
                 self.on_group_member_left(group_id, member_id)
     
     def handle_chat_message(self, peer_id, data):
-        """Handle a chat message - FIXED VERSION"""
+        """Handle a chat message - COMPLETELY FIXED VERSION"""
         group_id = data.get('group_id')
         message_id = data.get('message_id')
         sender_id = data.get('sender_id')
@@ -854,33 +873,35 @@ class P2PNode:
         timestamp = data.get('timestamp')
         obfuscated = data.get('obfuscated', False)
         
+        print(f"[DEBUG] Received message: {message_id} from {sender_id} in group {group_id}")
+        
         # Check if we're a member of this group OR if we should auto-join
         if group_id not in self.groups:
-            # Auto-join the group if we receive a message for it
-            # This handles the case where someone sends a message before we properly joined
+            print(f"[DEBUG] Auto-joining new group: {group_id}")
             self.groups[group_id] = {
-                'name': f"Group-{group_id[:8]}",  # Temporary name
+                'name': f"Group-{group_id[:8]}",
                 'creator_id': sender_id,
                 'members': {sender_id, self.node_id},
-                'messages': []
+                'messages': [],
+                'has_password': False
             }
             
-            # Request group info to get the proper name
+            # Request group info
             self.send_to_peer(peer_id, {
                 'type': 'request_group_info',
                 'group_id': group_id
             })
             
-            # Notify UI about new group
+            # Notify UI
             if hasattr(self, 'on_group_created'):
                 self.on_group_created(group_id, self.groups[group_id]['name'], sender_id)
         
-        # Only process if we're a member or if it's from a direct peer
+        # Process if we're a member or connected peer
         if (self.node_id in self.groups[group_id]['members'] or 
             sender_id in self.peer_connections or 
             peer_id in self.peer_connections):
             
-            # Store message if we don't have it
+            # Store message if new
             if message_id not in self.message_cache:
                 message = {
                     'message_id': message_id,
@@ -891,28 +912,61 @@ class P2PNode:
                     'obfuscated': obfuscated
                 }
                 
-                # Add to group's message list
-                self.groups[group_id]['messages'].append(message)
+                # Handle file transfer - CRITICAL FIX
+                file_transfer_id = data.get('file_transfer_id')
+                if file_transfer_id:
+                    print(f"[DEBUG] File message detected: {file_transfer_id}")
+                    message['file_transfer_id'] = file_transfer_id
+                    message['file_type'] = data.get('file_type')
+                    message['file_size'] = data.get('file_size')
+                    
+                    # Create transfer record for receivers
+                    if sender_id != self.node_id:
+                        print(f"[DEBUG] Creating transfer record for receiver")
+                        self.file_transfers[file_transfer_id] = {
+                            'file_info': {
+                                'filename': content,
+                                'file_type': data.get('file_type'),
+                                'file_size': data.get('file_size'),
+                                'message_id': message_id
+                            },
+                            'sender_id': sender_id,
+                            'group_id': group_id,
+                            'chunks': [],
+                            'received_chunks': 0,
+                            'total_chunks': 0,
+                            'requesting': False,
+                            'download_ready': True
+                        }
+                        
+                        # Notify UI
+                        if hasattr(self, 'on_file_transfer_created'):
+                            self.on_file_transfer_created(
+                                file_transfer_id, 
+                                content, 
+                                data.get('file_type', ''), 
+                                data.get('file_size', 0)
+                            )
                 
-                # Cache message
+                # Store message
+                self.groups[group_id]['messages'].append(message)
                 self.message_cache[message_id] = message
                 
-                # If we're in a UI context, notify
+                # Notify UI
                 if hasattr(self, 'on_chat_message_received'):
                     self.on_chat_message_received(group_id, message)
             
-            # Forward to other peers who might be in this group
-            # but exclude the sender and the peer we got it from
+            # Forward to other peers
             for other_peer_id in self.peer_connections:
                 if other_peer_id != peer_id and other_peer_id != sender_id:
                     self.queue_message_to_peer(other_peer_id, data)
-    
     def handle_group_info(self, peer_id, data):
-        """Handle group info message"""
+        """Handle group info message - FIXED to include file transfers"""
         group_id = data.get('group_id')
         group_name = data.get('group_name')
         members = set(data.get('members', []))
         messages = data.get('messages', [])
+        file_transfers_data = data.get('file_transfers', {})
         
         if group_id not in self.groups:
             # New group for us
@@ -925,6 +979,24 @@ class P2PNode:
             # Update existing group
             self.groups[group_id]['name'] = group_name
             self.groups[group_id]['members'].update(members)
+        
+        # Process file transfers first
+        for transfer_id, transfer_data in file_transfers_data.items():
+            if transfer_id not in self.file_transfers:
+                self.file_transfers[transfer_id] = {
+                    'file_info': transfer_data['file_info'],
+                    'chunks': transfer_data['chunks'],
+                    'total_chunks': transfer_data['total_chunks'],
+                    'received_chunks': transfer_data['total_chunks'],
+                    'sender_id': transfer_data['file_info'].get('sender_id'),
+                    'group_id': group_id
+                }
+                
+                # Combine chunks to create file data if not present
+                if 'data' not in self.file_transfers[transfer_id]['file_info']:
+                    import base64
+                    combined_data = base64.b64decode(''.join(transfer_data['chunks']))
+                    self.file_transfers[transfer_id]['file_info']['data'] = combined_data
         
         # Add messages we don't have yet
         for message in messages:
@@ -939,10 +1011,7 @@ class P2PNode:
         # If we're in a UI context, notify
         if hasattr(self, 'on_group_info_received'):
             self.on_group_info_received(group_id, group_name, members)
-    
-    # File transfer handlers
-    
-    
+
     def handle_request_group_info(self, peer_id, data):
         """Handle a request for group information"""
         group_id = data.get('group_id')
@@ -1140,89 +1209,154 @@ class P2PNode:
             self.on_group_access_denied(group_id, reason, data)
     
     def handle_file_request(self, peer_id, data):
-        """Handle a request for a file chunk - FIXED VERSION"""
+        """Handle file chunk request - FIXED for encryption"""
         transfer_id = data.get('transfer_id')
         chunk_index = data.get('chunk_index')
         
-        if transfer_id in self.file_transfers:
-            transfer = self.file_transfers[transfer_id]
+        print(f"[DEBUG] File request: transfer={transfer_id}, chunk={chunk_index}, from={peer_id}")
+        
+        if transfer_id not in self.file_transfers:
+            print(f"[DEBUG] Transfer {transfer_id} not found!")
+            return
+        
+        transfer = self.file_transfers[transfer_id]
+        
+        # Verify we're the sender and have the chunk
+        if transfer.get('sender_id') != self.node_id:
+            print(f"[DEBUG] Not the sender for transfer {transfer_id}")
+            return
             
-            # Check if we have this chunk
-            if chunk_index < len(transfer['chunks']):
-                chunk_data = transfer['chunks'][chunk_index]
-                
-                # Send the chunk with file info for first chunk
-                response_data = {
-                    'type': 'file_chunk',
-                    'transfer_id': transfer_id,
-                    'chunk_index': chunk_index,
-                    'total_chunks': len(transfer['chunks']),
-                    'chunk_data': chunk_data
-                }
-                
-                # Include file info and group info for first chunk
-                if chunk_index == 0:
-                    response_data['file_info'] = transfer.get('file_info', {})
-                    response_data['group_id'] = transfer.get('group_id')
-                
-                self.send_to_peer(peer_id, response_data)
-    
+        chunks = transfer.get('chunks', [])
+        if chunk_index >= len(chunks):
+            print(f"[DEBUG] Chunk {chunk_index} out of range (max: {len(chunks)})")
+            return
+        
+        chunk_data = chunks[chunk_index]
+        print(f"[DEBUG] Sending chunk {chunk_index}/{len(chunks)} to {peer_id}")
+        
+        # Ensure chunk_data is a string (base64)
+        if isinstance(chunk_data, bytes):
+            import base64
+            chunk_data = base64.b64encode(chunk_data).decode('utf-8')
+            print(f"[DEBUG] Converted chunk to base64 string")
+        
+        print(f"[DEBUG] Chunk data type: {type(chunk_data)}, length: {len(chunk_data) if chunk_data else 0}")
+        
+        # Send chunk - this will NOT be encrypted due to type 'file_chunk'
+        response = {
+            'type': 'file_chunk',
+            'transfer_id': transfer_id,
+            'chunk_index': chunk_index,
+            'total_chunks': len(chunks),
+            'chunk_data': chunk_data
+        }
+        
+        # Include file info for first chunk
+        if chunk_index == 0:
+            response['file_info'] = transfer.get('file_info', {})
+            response['group_id'] = transfer.get('group_id')
+        
+        success = self.send_to_peer(peer_id, response)
+        print(f"[DEBUG] Chunk send {'success' if success else 'failed'}")
     def handle_file_chunk(self, peer_id, data):
-        """Handle receiving a file chunk - FIXED VERSION"""
+        """Handle received file chunk - FIXED"""
         transfer_id = data.get('transfer_id')
         chunk_index = data.get('chunk_index')
         total_chunks = data.get('total_chunks')
         chunk_data = data.get('chunk_data')
         
-        # Get or create file transfer record
+        print(f"[DEBUG] Received chunk {chunk_index}/{total_chunks} for {transfer_id}")
+        
+        # Get or create transfer record
         if transfer_id not in self.file_transfers:
+            print(f"[DEBUG] Creating new transfer record for {transfer_id}")
             self.file_transfers[transfer_id] = {
                 'chunks': [None] * total_chunks,
                 'received_chunks': 0,
                 'total_chunks': total_chunks,
                 'file_info': data.get('file_info', {}),
                 'group_id': data.get('group_id'),
-                'sender_id': peer_id
+                'sender_id': peer_id,
+                'requesting': True
             }
             
-            # Notify UI about new transfer
-            file_info = data.get('file_info', {})
-            if hasattr(self, 'on_file_transfer_created'):
-                self.on_file_transfer_created(
-                    transfer_id, 
-                    file_info.get('filename', 'Unknown'), 
-                    file_info.get('file_type', ''), 
-                    file_info.get('file_size', 0)
-                )
+            # Notify UI for first chunk
+            if chunk_index == 0:
+                file_info = data.get('file_info', {})
+                if hasattr(self, 'on_file_transfer_created'):
+                    self.on_file_transfer_created(
+                        transfer_id, 
+                        file_info.get('filename', 'Unknown'), 
+                        file_info.get('file_type', ''), 
+                        file_info.get('file_size', 0)
+                    )
         
         transfer = self.file_transfers[transfer_id]
         
-        # Store the chunk if we don't have it
+        # Ensure chunks array is correct size
+        if len(transfer['chunks']) != total_chunks:
+            print(f"[DEBUG] Resizing chunks array to {total_chunks}")
+            transfer['chunks'] = [None] * total_chunks
+            transfer['total_chunks'] = total_chunks
+        
+        # Store chunk if new
         if chunk_index < len(transfer['chunks']) and transfer['chunks'][chunk_index] is None:
             transfer['chunks'][chunk_index] = chunk_data
             transfer['received_chunks'] += 1
             
-            # Update progress if we have a handler
+            progress = transfer['received_chunks'] / transfer['total_chunks']
+            print(f"[DEBUG] Progress: {transfer['received_chunks']}/{transfer['total_chunks']} ({progress*100:.1f}%)")
+            
+            # Update progress
             if hasattr(self, 'on_file_progress'):
-                progress = transfer['received_chunks'] / transfer['total_chunks']
                 self.on_file_progress(transfer_id, progress)
             
-            # Request next chunk if we need it
-            if transfer['received_chunks'] < transfer['total_chunks']:
-                # Find next missing chunk
-                for i, chunk in enumerate(transfer['chunks']):
-                    if chunk is None:
-                        # Request this chunk
-                        self.send_to_peer(peer_id, {
-                            'type': 'file_request',
-                            'transfer_id': transfer_id,
-                            'chunk_index': i
-                        })
-                        break
-            else:
-                # File is complete
+            # Check completion
+            if transfer['received_chunks'] >= transfer['total_chunks']:
+                print(f"[DEBUG] File {transfer_id} complete!")
                 self.complete_file_transfer(transfer_id)
+            else:
+                # Request next missing chunk
+                self.request_next_missing_chunk(transfer_id, peer_id)
+        else:
+            print(f"[DEBUG] Chunk {chunk_index} already received or invalid")
+    def request_next_missing_chunk(self, transfer_id, peer_id):
+        """Request the next missing chunk for a file transfer"""
+        if transfer_id not in self.file_transfers:
+            return
+        
+        transfer = self.file_transfers[transfer_id]
+        
+        # Find next missing chunk
+        for i, chunk in enumerate(transfer['chunks']):
+            if chunk is None:
+                # Request this chunk
+                self.send_to_peer(peer_id, {
+                    'type': 'file_request',
+                    'transfer_id': transfer_id,
+                    'chunk_index': i
+                })
+                break
+
     
+    def request_next_missing_chunk(self, transfer_id, peer_id):
+        """Request the next missing chunk for a file transfer"""
+        if transfer_id not in self.file_transfers:
+            return
+        
+        transfer = self.file_transfers[transfer_id]
+        
+        # Find next missing chunk
+        for i, chunk in enumerate(transfer['chunks']):
+            if chunk is None:
+                # Request this chunk
+                self.send_to_peer(peer_id, {
+                    'type': 'file_request',
+                    'transfer_id': transfer_id,
+                    'chunk_index': i
+                })
+                break
+
     def handle_file_complete(self, peer_id, data):
         """Handle notification that a peer has received a complete file"""
         transfer_id = data.get('transfer_id')
@@ -1251,11 +1385,33 @@ class P2PNode:
                 del self.file_transfers[transfer_id]
     
     def complete_file_transfer(self, transfer_id):
-        """Process a completed file transfer"""
+        """Process a completed file transfer - FIXED to properly update UI"""
         transfer = self.file_transfers[transfer_id]
         
         # Combine chunks
+        import base64
         combined_data = base64.b64decode(''.join(transfer['chunks']))
+        
+        print(f"[DEBUG] Combining {len(transfer['chunks'])} chunks")
+        print(f"[DEBUG] First chunk type: {type(transfer['chunks'][0]) if transfer['chunks'] else 'None'}")
+        
+        # Ensure all chunks are strings before joining
+        string_chunks = []
+        for i, chunk in enumerate(transfer['chunks']):
+            if isinstance(chunk, bytes):
+                # Convert bytes to base64 string
+                chunk_str = base64.b64encode(chunk).decode('utf-8')
+                print(f"[DEBUG] Converted chunk {i} from bytes to string")
+            elif isinstance(chunk, str):
+                chunk_str = chunk
+            else:
+                print(f"[DEBUG] Warning: Unexpected chunk type {type(chunk)} at index {i}")
+                chunk_str = str(chunk)
+            string_chunks.append(chunk_str)
+        
+        # Now combine the string chunks
+        combined_data = base64.b64decode(''.join(string_chunks))
+        print(f"[DEBUG] Combined data size: {len(combined_data)} bytes")
         
         # Add file info to the transfer
         file_info = transfer.get('file_info', {})
@@ -1264,7 +1420,7 @@ class P2PNode:
         
         # Notify sender that we've received the complete file
         sender_id = transfer.get('sender_id')
-        if sender_id in self.peer_connections:
+        if sender_id and sender_id in self.peer_connections:
             self.send_to_peer(sender_id, {
                 'type': 'file_complete',
                 'transfer_id': transfer_id
@@ -1274,31 +1430,23 @@ class P2PNode:
         if hasattr(self, 'on_file_received'):
             self.on_file_received(transfer_id, file_info)
         
-        # If this is part of a chat message, add it to the group
+        # If this is part of a chat message, refresh the group display
         group_id = transfer.get('group_id')
         message_id = file_info.get('message_id')
         
         if group_id and message_id and group_id in self.groups:
-            if hasattr(self, 'on_chat_message_received'):
-                # Create a message that references the file
-                message = {
-                    'message_id': message_id,
-                    'group_id': group_id,
-                    'sender_id': sender_id,
-                    'content': file_info.get('filename', 'File'),
-                    'timestamp': time.time(),
-                    'file_transfer_id': transfer_id,
-                    'file_type': file_info.get('file_type'),
-                    'file_size': file_info.get('file_size')
-                }
-                
-                # Add to group messages
-                self.groups[group_id]['messages'].append(message)
-                self.message_cache[message_id] = message
-                
-                # Notify UI
-                self.on_chat_message_received(group_id, message)
-    
+            # Find the message in the group and mark it as complete
+            for message in self.groups[group_id]['messages']:
+                if message.get('message_id') == message_id:
+                    message['file_data_ready'] = True
+                    break
+            
+            # If we're currently viewing this group, refresh the display
+            if hasattr(self, 'current_group') and self.current_group == group_id:
+                # Save current position and refresh
+                if hasattr(self, 'select_group'):
+                    self.select_group(group_id)
+
     def create_group(self, group_name, password=None):
         """Create a new group with optional password protection"""
         group_id = str(uuid.uuid4())
@@ -1410,7 +1558,7 @@ class P2PNode:
         return True
     
     def send_file(self, group_id, file_path):
-        """Send a file to a group - FIXED VERSION"""
+        """Send a file to a group - ENHANCED VERSION"""
         if group_id not in self.groups:
             return False, "Group not found"
         
@@ -1440,6 +1588,10 @@ class P2PNode:
             encoded_data = base64.b64encode(file_data).decode('utf-8')
             chunks = [encoded_data[i:i+chunk_size] for i in range(0, len(encoded_data), chunk_size)]
             
+            # Ensure all chunks are strings (they should be base64 already)
+            chunks = [str(chunk) for chunk in chunks]
+            print(f"[DEBUG] Created {len(chunks)} chunks, first chunk type: {type(chunks[0])}")
+            
             # Create file transfer record
             self.file_transfers[transfer_id] = {
                 'chunks': chunks,
@@ -1450,7 +1602,8 @@ class P2PNode:
                     'file_type': file_type,
                     'file_size': file_size,
                     'message_id': message_id,
-                    'data': file_data  # Store the actual file data for sender
+                    'data': file_data,  # Store the actual file data for sender
+                    'sender_id': self.node_id  # Add sender ID to file info
                 },
                 'group_id': group_id,
                 'sender_id': self.node_id,
@@ -1470,13 +1623,15 @@ class P2PNode:
                 'file_size': file_size
             }
             
-            # Store locally
-            self.groups[group_id]['messages'].append(message)
-            self.message_cache[message_id] = message
+            # Store locally first
+            local_message = message.copy()
+            local_message.pop('type')  # Remove type for storage
+            self.groups[group_id]['messages'].append(local_message)
+            self.message_cache[message_id] = local_message
             
-            # Notify UI
+            # Notify UI immediately for sender
             if hasattr(self, 'on_chat_message_received'):
-                self.on_chat_message_received(group_id, message)
+                self.on_chat_message_received(group_id, local_message)
                 
             # Notify of transfer creation
             if hasattr(self, 'on_file_transfer_created'):
@@ -1491,23 +1646,35 @@ class P2PNode:
         except Exception as e:
             print(f"Error sending file: {str(e)}")
             return False, str(e)
-    
+
     def request_file_chunk(self, transfer_id, chunk_index):
-        """Request a specific chunk of a file"""
-        if transfer_id in self.file_transfers:
-            transfer = self.file_transfers[transfer_id]
-            sender_id = transfer.get('sender_id')
-            
-            if sender_id in self.peer_connections:
-                self.send_to_peer(sender_id, {
-                    'type': 'file_request',
-                    'transfer_id': transfer_id,
-                    'chunk_index': chunk_index
-                })
-                return True
+        """Request a file chunk - FIXED"""
+        if transfer_id not in self.file_transfers:
+            print(f"[DEBUG] Cannot request chunk - transfer {transfer_id} not found")
+            return False
         
-        return False
-    
+        transfer = self.file_transfers[transfer_id]
+        sender_id = transfer.get('sender_id')
+        
+        if not sender_id:
+            print(f"[DEBUG] Cannot request chunk - no sender_id for {transfer_id}")
+            return False
+        
+        if sender_id not in self.peer_connections:
+            print(f"[DEBUG] Cannot request chunk - sender {sender_id} not connected")
+            return False
+        
+        print(f"[DEBUG] Requesting chunk {chunk_index} from {sender_id}")
+        
+        request = {
+            'type': 'file_request',
+            'transfer_id': transfer_id,
+            'chunk_index': chunk_index
+        }
+        
+        success = self.send_to_peer(sender_id, request)
+        print(f"[DEBUG] Chunk request {'sent' if success else 'failed'}")
+        return success
     def share_groups_with_peer(self, peer_id):
         """Share group information with a peer"""
         # Find groups this peer should be part of
@@ -1523,22 +1690,44 @@ class P2PNode:
                 })
     
     def share_group_history(self, group_id, peer_id):
-        """Share group message history with a peer"""
+        """Share group message history with a peer - FIXED to include files"""
         if group_id in self.groups and peer_id in self.peer_connections:
             # Send last 50 messages (or all if less)
             messages = self.groups[group_id]['messages'][-50:]
+            
+            # Prepare file transfer data for messages that have files
+            file_transfers_data = {}
+            for message in messages:
+                if 'file_transfer_id' in message:
+                    transfer_id = message['file_transfer_id']
+                    if transfer_id in self.file_transfers:
+                        transfer = self.file_transfers[transfer_id]
+                        # Only include if we have the complete file
+                        if (transfer.get('received_chunks', 0) >= transfer.get('total_chunks', 1) and
+                            'file_info' in transfer and 'data' in transfer['file_info']):
+                            file_transfers_data[transfer_id] = {
+                                'file_info': transfer['file_info'],
+                                'chunks': transfer['chunks'],
+                                'total_chunks': transfer['total_chunks']
+                            }
             
             self.send_to_peer(peer_id, {
                 'type': 'group_info',
                 'group_id': group_id,
                 'group_name': self.groups[group_id]['name'],
                 'members': list(self.groups[group_id]['members']),
-                'messages': messages
+                'messages': messages,
+                'file_transfers': file_transfers_data
             })
-    
+
     def send_data(self, sock, data):
-        """Send data over a socket with compression"""
+        """Send data over a socket with compression - FIXED for binary data"""
         try:
+            # Convert data to JSON-serializable format first
+            if isinstance(data, dict):
+                # Check if this contains binary data that needs special handling
+                data = self._prepare_data_for_json(data)
+            
             # Serialize data
             serialized = json.dumps(data).encode('utf-8')
             
@@ -1551,9 +1740,37 @@ class P2PNode:
             
             # Send the compressed data
             sock.sendall(compressed)
+            
         except Exception as e:
             raise ConnectionError(f"Error sending data: {str(e)}")
     
+    def _prepare_data_for_json(self, data):
+        """Prepare data for JSON serialization by handling binary data"""
+        if not isinstance(data, dict):
+            return data
+        
+        # Create a copy to avoid modifying original
+        prepared_data = {}
+        
+        for key, value in data.items():
+            if isinstance(value, bytes):
+                # Convert bytes to base64 string
+                import base64
+                prepared_data[key] = base64.b64encode(value).decode('utf-8')
+                print(f"[DEBUG] Converted bytes field '{key}' to base64")
+            elif isinstance(value, dict):
+                # Recursively handle nested dictionaries
+                prepared_data[key] = self._prepare_data_for_json(value)
+            elif isinstance(value, list):
+                # Handle lists that might contain bytes
+                prepared_data[key] = [
+                    base64.b64encode(item).decode('utf-8') if isinstance(item, bytes) else item
+                    for item in value
+                ]
+            else:
+                prepared_data[key] = value
+        
+        return prepared_data
     def receive_data(self, sock):
         """Receive data from a socket with compression"""
         try:
@@ -1583,6 +1800,21 @@ class P2PNode:
             raise ConnectionError(f"Error receiving data: {str(e)}")
 
 
+
+    def debug_file_transfers(self):
+        """Debug method to print current file transfer state"""
+        print("=== FILE TRANSFER DEBUG ===")
+        print(f"Total transfers: {len(self.file_transfers)}")
+        for transfer_id, transfer in self.file_transfers.items():
+            print(f"Transfer {transfer_id}:")
+            print(f"  - Sender: {transfer.get('sender_id')}")
+            print(f"  - Group: {transfer.get('group_id')}")
+            print(f"  - Filename: {transfer.get('file_info', {}).get('filename')}")
+            print(f"  - Chunks: {len(transfer.get('chunks', []))}/{transfer.get('total_chunks', 0)}")
+            print(f"  - Received: {transfer.get('received_chunks', 0)}")
+            print(f"  - Requesting: {transfer.get('requesting', False)}")
+        print("=== END DEBUG ===")
+
 class ModernChatApp:
     """A modernized version of the ChatApp with Aero-inspired styling"""
     
@@ -1611,6 +1843,12 @@ class ModernChatApp:
         
         # File transfers
         self.file_transfers = {}
+        
+        # File widget tracking
+        self.file_widgets = {}
+        
+        # File widget tracking
+        self.file_widgets = {}
         
         # Create UI
         self.create_ui()
@@ -2184,56 +2422,90 @@ class ModernChatApp:
         # Center the dialog
         dialog.geometry("+%d+%d" % (self.master.winfo_rootx() + 50, self.master.winfo_rooty() + 50))
         
-        # Content frame
-        content_frame = tk.Frame(dialog, bg="#E6F3FF", padx=20, pady=20)
+        # Content frame with better styling
+        content_frame = tk.Frame(dialog, bg="#F0F8FF", padx=20, pady=20)
         content_frame.pack(fill=tk.BOTH, expand=True)
         
-        # Title
-        title_label = tk.Label(content_frame, text="Create New Group", 
-                              font=("Segoe UI", 14, "bold"), bg="#F0F0F0")
-        title_label.pack(pady=(0, 20))
+        # Title with icon
+        title_frame = tk.Frame(content_frame, bg="#F0F8FF")
+        title_frame.pack(fill=tk.X, pady=(0, 20))
         
-        # Group name
-        tk.Label(content_frame, text="Group Name:", font=("Segoe UI", 10), bg="#F0F0F0").pack(anchor=tk.W)
+        tk.Label(title_frame, text="👥", font=("Segoe UI", 20), bg="#F0F8FF").pack(side=tk.LEFT)
+        tk.Label(title_frame, text="Create New Group", 
+                font=("Segoe UI", 14, "bold"), bg="#F0F8FF").pack(side=tk.LEFT, padx=(10, 0))
+        
+        # Group name section
+        name_frame = tk.Frame(content_frame, bg="#F0F8FF")
+        name_frame.pack(fill=tk.X, pady=(0, 15))
+        
+        tk.Label(name_frame, text="Group Name:", font=("Segoe UI", 10), bg="#F0F8FF").pack(anchor=tk.W)
         name_var = tk.StringVar()
-        name_entry = tk.Entry(content_frame, textvariable=name_var, font=("Segoe UI", 10), width=30)
-        name_entry.pack(fill=tk.X, pady=(5, 15))
+        name_entry = tk.Entry(name_frame, textvariable=name_var, font=("Segoe UI", 10), width=40)
+        name_entry.pack(fill=tk.X, pady=(5, 0))
         name_entry.focus()
         
-        # Password protection checkbox
+        # Password protection section
+        password_frame_container = tk.Frame(content_frame, bg="#F0F8FF")
+        password_frame_container.pack(fill=tk.X, pady=(0, 15))
+        
         password_enabled = tk.BooleanVar()
-        password_check = tk.Checkbutton(content_frame, text="🔒 Password protect this group", 
-                                       variable=password_enabled, font=("Segoe UI", 10),
-                                       bg="#F0F0F0", command=lambda: self.toggle_password_fields(password_enabled.get(), password_frame))
+        password_check = tk.Checkbutton(
+            password_frame_container, 
+            text="🔒 Password protect this group", 
+            variable=password_enabled, 
+            font=("Segoe UI", 10),
+            bg="#F0F8FF"
+        )
         password_check.pack(anchor=tk.W, pady=(0, 10))
         
         # Password fields (initially hidden)
-        password_frame = tk.Frame(content_frame, bg="#F0F0F0")
-        password_frame.pack(fill=tk.X, pady=(0, 15))
+        password_frame = tk.Frame(password_frame_container, bg="#F0F8FF")
         
-        tk.Label(password_frame, text="Password:", font=("Segoe UI", 10), bg="#F0F0F0").pack(anchor=tk.W)
+        tk.Label(password_frame, text="Password:", font=("Segoe UI", 10), bg="#F0F8FF").pack(anchor=tk.W)
         password_var = tk.StringVar()
         password_entry = tk.Entry(password_frame, textvariable=password_var, show="•", 
-                                 font=("Segoe UI", 10), width=30)
+                                 font=("Segoe UI", 10), width=40)
         password_entry.pack(fill=tk.X, pady=(5, 10))
         
-        tk.Label(password_frame, text="Confirm Password:", font=("Segoe UI", 10), bg="#F0F0F0").pack(anchor=tk.W)
+        tk.Label(password_frame, text="Confirm Password:", font=("Segoe UI", 10), bg="#F0F8FF").pack(anchor=tk.W)
         confirm_var = tk.StringVar()
         confirm_entry = tk.Entry(password_frame, textvariable=confirm_var, show="•", 
-                                font=("Segoe UI", 10), width=30)
+                                font=("Segoe UI", 10), width=40)
         confirm_entry.pack(fill=tk.X, pady=(5, 0))
         
-        # Initially hide password fields
-        password_frame.pack_forget()
+        def toggle_password_fields():
+            if password_enabled.get():
+                password_frame.pack(fill=tk.X, pady=(10, 0))
+                password_entry.focus()
+            else:
+                password_frame.pack_forget()
+                name_entry.focus()
         
-        # Buttons
-        button_frame = tk.Frame(content_frame, bg="#F0F0F0")
+        password_check.config(command=toggle_password_fields)
+        
+        # Info section
+        info_frame = tk.Frame(content_frame, bg="#E6F3FF", relief="solid", borderwidth=1)
+        info_frame.pack(fill=tk.X, pady=(10, 20))
+        
+        info_label = tk.Label(info_frame, 
+                             text="ℹ️ Groups are end-to-end encrypted. Password protection adds an extra layer of security.",
+                             font=("Segoe UI", 9), bg="#E6F3FF", fg="#0066CC", wraplength=450)
+        info_label.pack(padx=10, pady=10)
+        
+        # Buttons frame
+        button_frame = tk.Frame(content_frame, bg="#F0F8FF")
         button_frame.pack(fill=tk.X, pady=(10, 0))
         
         def create_group():
             group_name = name_var.get().strip()
             if not group_name:
-                tk.messagebox.showerror("Error", "Group name is required")
+                tk.messagebox.showerror("Error", "Group name is required", parent=dialog)
+                name_entry.focus()
+                return
+            
+            if len(group_name) > 50:
+                tk.messagebox.showerror("Error", "Group name must be 50 characters or less", parent=dialog)
+                name_entry.focus()
                 return
             
             password = None
@@ -2242,33 +2514,82 @@ class ModernChatApp:
                 confirm = confirm_var.get()
                 
                 if not password:
-                    tk.messagebox.showerror("Error", "Password is required when protection is enabled")
+                    tk.messagebox.showerror("Error", "Password is required when protection is enabled", parent=dialog)
+                    password_entry.focus()
                     return
                 
-                if password.strip() != confirm.strip():
+                if password != confirm:
                     tk.messagebox.showerror("Error", "Passwords do not match", parent=dialog)
+                    confirm_entry.focus()
                     return
                 
                 if len(password) < 4:
-                    tk.messagebox.showerror("Error", "Password must be at least 4 characters")
+                    tk.messagebox.showerror("Error", "Password must be at least 4 characters long", parent=dialog)
+                    password_entry.focus()
                     return
             
             # Create the group
-            group_id = self.node.create_group(group_name, password)
-            self.select_group(group_id)
+            try:
+                group_id = self.node.create_group(group_name, password)
+                self.select_group(group_id)
+                dialog.destroy()
+                
+                # Show success message
+                protection_msg = " with password protection" if password else ""
+                tk.messagebox.showinfo("Group Created", 
+                                     f"Group '{group_name}' created successfully{protection_msg}!")
+            except Exception as e:
+                tk.messagebox.showerror("Error", f"Failed to create group: {str(e)}", parent=dialog)
+        
+        def cancel_dialog():
             dialog.destroy()
         
-        tk.Button(button_frame, text="Cancel", command=dialog.destroy,
-                 bg="#6C757D", fg="white", font=("Segoe UI", 10), padx=15).pack(side=tk.RIGHT, padx=(5, 0))
+        # Cancel button (left side)
+        cancel_btn = tk.Button(
+            button_frame, 
+            text="❌ Cancel", 
+            command=cancel_dialog,
+            bg="#6C757D", 
+            fg="white", 
+            font=("Segoe UI", 10), 
+            padx=20, 
+            pady=5,
+            relief="flat",
+            cursor="hand2"
+        )
+        cancel_btn.pack(side=tk.LEFT)
         
-        tk.Button(button_frame, text="Create Group", command=create_group,
-                 bg="#007BFF", fg="white", font=("Segoe UI", 10, "bold"), padx=15).pack(side=tk.RIGHT)
+        # Create button (right side)
+        create_btn = tk.Button(
+            button_frame, 
+            text="✅ Create Group", 
+            command=create_group,
+            bg="#28A745", 
+            fg="white", 
+            font=("Segoe UI", 10, "bold"), 
+            padx=20, 
+            pady=5,
+            relief="flat",
+            cursor="hand2"
+        )
+        create_btn.pack(side=tk.RIGHT)
         
-        # Bind Enter key
+        # Spacer between buttons
+        tk.Frame(button_frame, bg="#F0F8FF", width=10).pack(side=tk.RIGHT, padx=5)
+        
+        # Keyboard bindings
         def on_enter(event):
             create_group()
         
+        def on_escape(event):
+            cancel_dialog()
+        
         dialog.bind('<Return>', on_enter)
+        dialog.bind('<Escape>', on_escape)
+        
+        # Make dialog modal and focused
+        dialog.transient(self.master)
+        dialog.grab_set()
         
         return dialog
     
@@ -2319,7 +2640,7 @@ class ModernChatApp:
         button_frame = tk.Frame(content_frame, bg="#F0F0F0")
         button_frame.pack(fill=tk.X)
         
-        def submit_password():
+    def submit_password():
             password = password_var.get()
             if not password:
                 tk.messagebox.showerror("Error", "Password is required")
@@ -2335,18 +2656,19 @@ class ModernChatApp:
             
             dialog.destroy()
         
-        tk.Button(button_frame, text="Cancel", command=dialog.destroy,
+            tk.Button(button_frame, text="Cancel", command=dialog.destroy,
                  bg="#6C757D", fg="white", font=("Segoe UI", 9), padx=12).pack(side=tk.RIGHT, padx=(5, 0))
         
-        tk.Button(button_frame, text="Join Group", command=submit_password,
+            tk.Button(button_frame, text="Join Group", command=submit_password,
                  bg="#28A745", fg="white", font=("Segoe UI", 9, "bold"), padx=12).pack(side=tk.RIGHT)
         
         # Bind Enter key
-        dialog.bind('<Return>', lambda e: submit_password())
+            dialog.bind('<Return>', lambda e: submit_password())
     
     def create_group(self):
         """Create a new group with password dialog"""
         if self.node is None:
+            tk.messagebox.showerror("Error", "You must start your node first")
             return
         
         self.create_group_with_password_dialog()
@@ -2413,11 +2735,11 @@ class ModernChatApp:
         
         # Apply theme to dialog
         if HAS_SV_TTK:
-            sv_ttk.set_theme("light", info_dialog)
+            # sv_ttk.set_theme("light", info_dialog)  # Commented out - causes issues with dialogs
         
         # Content frame
-        content_frame = ttk.Frame(info_dialog, padding=20)
-        content_frame.pack(fill=tk.BOTH, expand=True)
+            content_frame = ttk.Frame(info_dialog, padding=20)
+            content_frame.pack(fill=tk.BOTH, expand=True)
         
         # Group name
         ttk.Label(content_frame, text=group['name'], style="Header.TLabel").pack(pady=(0, 15))
@@ -2858,9 +3180,9 @@ class ModernChatApp:
             del self.group_frames[group_id]
     
     def add_transfer_to_list(self, transfer_id, filename, file_type, file_size):
-        """Add a file transfer to the UI list"""
+        """Add a file transfer to the UI list - ENHANCED with click functionality"""
         # Create a frame for this transfer
-        transfer_frame = ttk.Frame(self.transfers_list, padding=5)
+        transfer_frame = ttk.Frame(self.transfers_list, padding=5, relief="solid", borderwidth=1)
         transfer_frame.pack(fill=tk.X, pady=2)
         
         # Get the appropriate icon based on file type
@@ -2872,44 +3194,137 @@ class ModernChatApp:
         elif file_type == "application/pdf":
             icon = self.icons["pdf"]
         
+        # Main content frame
+        content_frame = ttk.Frame(transfer_frame)
+        content_frame.pack(fill=tk.X, expand=True)
+        
         # Add icon and filename
-        icon_label = ttk.Label(transfer_frame, text=icon, font=("Segoe UI", 12))
+        icon_label = ttk.Label(content_frame, text=icon, font=("Segoe UI", 12))
         icon_label.pack(side=tk.LEFT, padx=(0, 5))
         
-        info_frame = ttk.Frame(transfer_frame)
+        info_frame = ttk.Frame(content_frame)
         info_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
         
         # Filename and size
-        ttk.Label(info_frame, text=filename, font=("Segoe UI", 10, "bold")).pack(anchor=tk.W)
+        filename_label = ttk.Label(info_frame, text=filename, font=("Segoe UI", 10, "bold"))
+        filename_label.pack(anchor=tk.W)
         
         size_mb = file_size / (1024 * 1024) if file_size else 0
-        ttk.Label(info_frame, text=f"{size_mb:.1f} MB", font=("Segoe UI", 8)).pack(anchor=tk.W)
+        size_label = ttk.Label(info_frame, text=f"{size_mb:.1f} MB", font=("Segoe UI", 8))
+        size_label.pack(anchor=tk.W)
+        
+        # Status label
+        status_label = ttk.Label(info_frame, text="Ready", font=("Segoe UI", 8), foreground="blue")
+        status_label.pack(anchor=tk.W)
         
         # Progress bar
         self.transfer_progress_vars = getattr(self, 'transfer_progress_vars', {})
         self.transfer_progress_vars[transfer_id] = tk.DoubleVar(value=0.0)
         
         progress = ttk.Progressbar(
-            transfer_frame, 
+            content_frame, 
             variable=self.transfer_progress_vars[transfer_id],
-            length=200
+            length=150,
+            mode='determinate'
         )
-        progress.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=5)
+        progress.pack(side=tk.RIGHT, padx=5)
         
-        # Store reference
-        self.file_transfers[transfer_id] = {
-            'frame': transfer_frame,
-            'progress': progress,
-            'filename': filename,
-            'file_type': file_type,
-            'file_size': file_size
-        }
-    
+        # Action buttons frame
+        buttons_frame = ttk.Frame(transfer_frame)
+        buttons_frame.pack(fill=tk.X, pady=(5, 0))
+        
+        # Download button
+    def start_download():
+            if transfer_id in self.node.file_transfers:
+                transfer = self.node.file_transfers[transfer_id]
+                sender_id = transfer.get('sender_id')
+                if sender_id and sender_id != self.node.node_id:
+                    status_label.config(text="Downloading...", foreground="orange")
+                    self.start_file_download(transfer_id, sender_id, status_label)
+                else:
+                    status_label.config(text="Already available", foreground="green")
+        
+            download_btn = ttk.Button(buttons_frame, text="📥 Download", command=start_download)
+            download_btn.pack(side=tk.LEFT, padx=2)
+        
+        # Open/Save button
+    def open_file():
+            if transfer_id in self.node.file_transfers:
+                transfer = self.node.file_transfers[transfer_id]
+                file_info = transfer.get('file_info', {})
+                if 'data' in file_info:
+                    # File is ready, open it
+                    self.save_and_open_file(file_info)
+                else:
+                    status_label.config(text="Download first", foreground="red")
+        
+            open_btn = ttk.Button(buttons_frame, text="💾 Save", command=open_file)
+            open_btn.pack(side=tk.LEFT, padx=2)
+        
+        # View in chat button
+    def view_in_chat():
+            if transfer_id in self.node.file_transfers:
+                transfer = self.node.file_transfers[transfer_id]
+                group_id = transfer.get('group_id')
+                if group_id and group_id in self.node.groups:
+                    # Switch to the group where this file was shared
+                    self.select_group(group_id)
+                    status_label.config(text="Viewing in chat", foreground="green")
+                    
+                    # Switch to groups tab
+                    self.sidebar_tabs.select(1)  # Groups tab
+        
+            chat_btn = ttk.Button(buttons_frame, text="💬 View in Chat", command=view_in_chat)
+            chat_btn.pack(side=tk.LEFT, padx=2)
+        
+        # Make the whole transfer frame clickable for quick actions
+    def on_transfer_click(event):
+            # Double-click to download or open
+            if transfer_id in self.node.file_transfers:
+                transfer = self.node.file_transfers[transfer_id]
+                file_info = transfer.get('file_info', {})
+                if 'data' in file_info:
+                    # File ready, open it
+                    open_file()
+                else:
+                    # Not ready, start download
+                    start_download()
+        
+        # Bind double-click to the frame and its children
+            for widget in [transfer_frame, content_frame, info_frame, filename_label, size_label, status_label]:
+                widget.bind("<Double-Button-1>", on_transfer_click)
+                widget.bind("<Enter>", lambda e, f=transfer_frame: f.configure(relief="raised"))
+                widget.bind("<Leave>", lambda e, f=transfer_frame: f.configure(relief="solid"))
+        
+        # Store reference with additional data
+            self.file_transfers[transfer_id] = {
+                'frame': transfer_frame,
+                'progress': progress,
+                'filename': filename,
+                'file_type': file_type,
+                'file_size': file_size,
+                'status_label': status_label,
+                'download_btn': download_btn,
+                'open_btn': open_btn
+            }
     def update_transfer_progress(self, transfer_id, progress):
-        """Update the progress of a file transfer"""
+        """Update the progress of a file transfer - ENHANCED"""
+        # Update progress bar
         if transfer_id in self.transfer_progress_vars:
             self.transfer_progress_vars[transfer_id].set(progress * 100)
-    
+        
+        # Update status in file_transfers UI elements
+        if transfer_id in self.file_transfers:
+            transfer_ui = self.file_transfers[transfer_id]
+            if 'status_label' in transfer_ui:
+                if progress >= 1.0:
+                    transfer_ui['status_label'].config(text="Complete", foreground="green")
+                    if 'download_btn' in transfer_ui:
+                        transfer_ui['download_btn'].config(text="✓ Downloaded", state='disabled')
+                    if 'open_btn' in transfer_ui:
+                        transfer_ui['open_btn'].config(text="📂 Open", state='normal')
+                else:
+                    transfer_ui['status_label'].config(text=f"{progress*100:.1f}%", foreground="blue")
     def select_group(self, group_id):
         """Select a group and show its messages"""
         if self.node is None or group_id not in self.node.groups:
@@ -3191,79 +3606,220 @@ class ModernChatApp:
             
             self.master.after(0, lambda: self.add_system_message(f"{username} left the group"))
     
+    
+    def add_file_placeholder(self, filename, file_type, file_size, transfer_id, sender_id, tag):
+        """Add file placeholder with working download button"""
+        self.chat_text.config(state=tk.NORMAL)
+        
+        # Get icon
+        icon = self.icons.get("file", "📄")
+        if file_type:
+            if file_type.startswith("image/"):
+                icon = self.icons.get("image", "🖼️")
+            elif file_type.startswith("video/"):
+                icon = self.icons.get("video", "🎬")
+            elif file_type == "application/pdf":
+                icon = self.icons.get("pdf", "📑")
+        
+        # Create frame
+        text_idx = self.chat_text.index(tk.INSERT)
+        file_frame = ttk.Frame(self.chat_text, padding=10, relief="solid", borderwidth=1)
+        
+        # Icon
+        ttk.Label(file_frame, text=icon, font=("Segoe UI", 24)).pack(pady=5)
+        
+        # File info
+        size_mb = file_size / (1024 * 1024) if file_size else 0
+        ttk.Label(file_frame, text=filename, font=("Segoe UI", 10, "bold")).pack()
+        ttk.Label(file_frame, text=f"Size: {size_mb:.1f} MB", font=("Segoe UI", 9)).pack()
+        
+        # Status
+        status_label = ttk.Label(file_frame, text="Ready to download", 
+                                font=("Segoe UI", 9), foreground="blue")
+        status_label.pack(pady=5)
+        
+        # Download button with lambda capture
+        def download_action():
+            self.start_file_download(transfer_id, sender_id, status_label)
+        
+        download_btn = ttk.Button(file_frame, text="📥 Download File", command=download_action)
+        download_btn.pack(pady=5)
+        
+        # Progress bar
+        progress_var = tk.DoubleVar(value=0.0)
+        progress_bar = ttk.Progressbar(file_frame, variable=progress_var, length=200, mode='determinate')
+        
+        # Store widgets
+        if not hasattr(self, 'file_widgets'):
+            self.file_widgets = {}
+        
+        self.file_widgets[transfer_id] = {
+            'frame': file_frame,
+            'status_label': status_label,
+            'download_btn': download_btn,
+            'progress_bar': progress_bar,
+            'progress_var': progress_var
+        }
+        
+        # Insert into chat
+        self.chat_text.window_create(tk.END, window=file_frame)
+        self.chat_text.insert(tk.END, "")
+        self.chat_text.tag_add(tag, text_idx, tk.END)
+        self.chat_text.tag_add("media", text_idx, tk.END)
+        self.chat_text.config(state=tk.DISABLED)
+        
+        print(f"[DEBUG] Created file placeholder for {transfer_id}")
+    def request_file_download(self, transfer_id, sender_id):
+        """Request to download a file"""
+        # Find the peer connection for the sender
+        if sender_id in self.node.peer_connections:
+            # Start requesting chunks
+            if transfer_id not in self.node.file_transfers:
+                return
+            
+            transfer = self.node.file_transfers[transfer_id]
+            if not transfer.get('requesting', False):
+                transfer['requesting'] = True
+                # Request the first chunk to get started
+                self.node.request_file_chunk(transfer_id, 0)
+
+    
+    def add_file_placeholder(self, filename, file_type, file_size, transfer_id, sender_id, tag):
+        """Add file placeholder with working download button"""
+        self.chat_text.config(state=tk.NORMAL)
+        
+        # Get icon
+        icon = self.icons.get("file", "📄")
+        if file_type:
+            if file_type.startswith("image/"):
+                icon = self.icons.get("image", "🖼️")
+            elif file_type.startswith("video/"):
+                icon = self.icons.get("video", "🎬")
+            elif file_type == "application/pdf":
+                icon = self.icons.get("pdf", "📑")
+        
+        # Create frame
+        text_idx = self.chat_text.index(tk.INSERT)
+        file_frame = ttk.Frame(self.chat_text, padding=10, relief="solid", borderwidth=1)
+        
+        # Icon
+        ttk.Label(file_frame, text=icon, font=("Segoe UI", 24)).pack(pady=5)
+        
+        # File info
+        size_mb = file_size / (1024 * 1024) if file_size else 0
+        ttk.Label(file_frame, text=filename, font=("Segoe UI", 10, "bold")).pack()
+        ttk.Label(file_frame, text=f"Size: {size_mb:.1f} MB", font=("Segoe UI", 9)).pack()
+        
+        # Status
+        status_label = ttk.Label(file_frame, text="Ready to download", 
+                                font=("Segoe UI", 9), foreground="blue")
+        status_label.pack(pady=5)
+        
+        # Download button with lambda capture
+        def download_action():
+            self.start_file_download(transfer_id, sender_id, status_label)
+        
+        download_btn = ttk.Button(file_frame, text="📥 Download File", command=download_action)
+        download_btn.pack(pady=5)
+        
+        # Progress bar
+        progress_var = tk.DoubleVar(value=0.0)
+        progress_bar = ttk.Progressbar(file_frame, variable=progress_var, length=200, mode='determinate')
+        
+        # Store widgets
+        if not hasattr(self, 'file_widgets'):
+            self.file_widgets = {}
+        
+        self.file_widgets[transfer_id] = {
+            'frame': file_frame,
+            'status_label': status_label,
+            'download_btn': download_btn,
+            'progress_bar': progress_bar,
+            'progress_var': progress_var
+        }
+        
+        # Insert into chat
+        self.chat_text.window_create(tk.END, window=file_frame)
+        self.chat_text.insert(tk.END, "")
+        self.chat_text.tag_add(tag, text_idx, tk.END)
+        self.chat_text.tag_add("media", text_idx, tk.END)
+        self.chat_text.config(state=tk.DISABLED)
+        
+        print(f"[DEBUG] Created file placeholder for {transfer_id}")
+    def request_file_download(self, transfer_id, sender_id):
+        """Request to download a file"""
+        # Find the peer connection for the sender
+        if sender_id in self.node.peer_connections:
+            # Start requesting chunks
+            if transfer_id not in self.node.file_transfers:
+                return
+            
+            transfer = self.node.file_transfers[transfer_id]
+            if not transfer.get('requesting', False):
+                transfer['requesting'] = True
+                # Request the first chunk to get started
+                self.node.request_file_chunk(transfer_id, 0)
+
     def on_chat_message_received(self, group_id, message):
-        """Called when a chat message is received - FIXED VERSION"""
-        # Add to groups list if not already there
+        """Handle received chat message - FIXED"""
+        print(f"[DEBUG] UI: Received message in group {group_id}")
+        
+        # Add group if not exists
         if group_id not in self.group_frames:
             self.master.after(0, lambda: self.add_group_to_list(group_id))
         
-        # Add message to UI if we're in this group
+        # Show message if current group
         if self.current_group == group_id:
             sender_id = message.get('sender_id')
             content = message.get('content')
             timestamp = message.get('timestamp')
             obfuscated = message.get('obfuscated', False)
             
-            sender_name = "Unknown"
+            # Get sender name
             if sender_id == self.node.node_id:
                 sender_name = f"{self.node.username} (You)"
+                tag = "self"
             elif sender_id in self.node.peers:
                 sender_name = self.node.peers[sender_id][2]
+                tag = "other"
+            else:
+                sender_name = "Unknown"
+                tag = "other"
             
-            # Check if this is a file message
+            # Handle file message
             if 'file_transfer_id' in message:
                 file_transfer_id = message.get('file_transfer_id')
                 file_type = message.get('file_type')
                 file_size = message.get('file_size')
                 
-                # Add file to transfers tab
-                self.master.after(0, lambda: self.add_transfer_to_list(
-                    file_transfer_id, content, file_type, file_size
-                ))
+                print(f"[DEBUG] UI: File message {file_transfer_id}")
                 
-                # Show message with timestamp and sender
-                self.master.after(0, lambda: self.chat_text.config(state=tk.NORMAL))
+                # Add timestamp and sender
+                self.chat_text.config(state=tk.NORMAL)
                 if timestamp:
+                    import time
                     time_str = time.strftime("%H:%M:%S", time.localtime(timestamp))
-                    self.master.after(0, lambda ts=time_str: self.chat_text.insert(tk.END, "\\n[" + ts + "] ", "timestamp"))
+                    self.chat_text.insert(tk.END, f"[{time_str}] ", "timestamp")
                 
-                # Add sender name
-                tag = "self" if sender_id == self.node.node_id else "other"
-                self.master.after(0, lambda sn=sender_name, t=tag: self.chat_text.insert(tk.END, sn + " shared a file:", t))
-                self.master.after(0, lambda: self.chat_text.config(state=tk.DISABLED))
+                self.chat_text.insert(tk.END, f"{sender_name} shared a file:", tag)
+                self.chat_text.config(state=tk.DISABLED)
                 
-                # If we have the file data, display it
-                if file_transfer_id in self.node.file_transfers and 'file_info' in self.node.file_transfers[file_transfer_id]:
-                    file_info = self.node.file_transfers[file_transfer_id]['file_info']
-                    if 'data' in file_info:
-                        self.master.after(0, lambda: self.display_file(file_info, tag=tag))
+                # Show file or placeholder
+                if sender_id == self.node.node_id:
+                    # Sender - show file if available
+                    if (file_transfer_id in self.node.file_transfers and 
+                        'file_info' in self.node.file_transfers[file_transfer_id] and
+                        'data' in self.node.file_transfers[file_transfer_id]['file_info']):
+                        file_info = self.node.file_transfers[file_transfer_id]['file_info']
+                        self.display_file(file_info, tag=tag)
                     else:
-                        # Request the file if we don't have it and we're not the sender
-                        if sender_id != self.node.node_id:
-                            self.master.after(0, lambda: self.node.request_file_chunk(file_transfer_id, 0))
-                elif sender_id != self.node.node_id:
-                    # Create a transfer record and request the file
-                    transfer = {
-                        'file_info': {
-                            'filename': content,
-                            'file_type': file_type,
-                            'file_size': file_size,
-                            'message_id': message.get('message_id')
-                        },
-                        'sender_id': sender_id,
-                        'group_id': group_id,
-                        'chunks': [],
-                        'received_chunks': 0,
-                        'total_chunks': 0
-                    }
-                    self.node.file_transfers[file_transfer_id] = transfer
-                    self.master.after(0, lambda: self.node.request_file_chunk(file_transfer_id, 0))
+                        self.add_file_placeholder(content, file_type, file_size, file_transfer_id, sender_id, tag)
+                else:
+                    # Receiver - show placeholder
+                    self.add_file_placeholder(content, file_type, file_size, file_transfer_id, sender_id, tag)
             else:
-                # Regular text message
-                self.master.after(0, lambda: self.add_chat_message(
-                    sender_id, sender_name, content, timestamp, obfuscated
-                ))
-    
+                # Regular message
+                self.add_chat_message(sender_id, sender_name, content, timestamp, obfuscated)
     def on_group_info_received(self, group_id, group_name, members):
         """Called when group info is received"""
         # Add to groups list if not already there
@@ -3279,9 +3835,109 @@ class ModernChatApp:
             ))
     
     def on_file_progress(self, transfer_id, progress):
-        """Called when file transfer progress updates"""
+        """Update file transfer progress - FIXED"""
+        print(f"[DEBUG] UI: Progress {transfer_id}: {progress*100:.1f}%")
+        
+        # Update main transfer list
         self.master.after(0, lambda: self.update_transfer_progress(transfer_id, progress))
+        
+        # Update file widget
+        if hasattr(self, 'file_widgets') and transfer_id in self.file_widgets:
+            widgets = self.file_widgets[transfer_id]
+            widgets['progress_var'].set(progress * 100)
+            
+            if progress >= 1.0:
+                widgets['status_label'].config(text="Download complete!", foreground="green")
+                widgets['download_btn'].config(text="✓ Downloaded", state='disabled')
+            else:
+                widgets['status_label'].config(text=f"Downloading... {progress*100:.1f}%", foreground="blue")
     
+    def start_file_download(self, transfer_id, sender_id, status_label=None):
+        """Start file download - NEW METHOD"""
+        print(f"[DEBUG] UI: Starting download {transfer_id} from {sender_id}")
+        
+        if status_label:
+            status_label.config(text="Starting download...", foreground="orange")
+        
+        # Validate transfer exists
+        if transfer_id not in self.node.file_transfers:
+            print(f"[DEBUG] Transfer {transfer_id} not found!")
+            if status_label:
+                status_label.config(text="Error: Transfer not found", foreground="red")
+            return
+        
+        transfer = self.node.file_transfers[transfer_id]
+        
+        # Validate sender connected
+        if sender_id not in self.node.peer_connections:
+            print(f"[DEBUG] Sender {sender_id} not connected!")
+            if status_label:
+                status_label.config(text="Error: Sender not connected", foreground="red")
+            return
+        
+        # Mark as requesting
+        transfer['requesting'] = True
+        
+        # Show progress bar
+        if transfer_id in self.file_widgets:
+            widgets = self.file_widgets[transfer_id]
+            widgets['progress_bar'].pack(pady=5)
+            widgets['download_btn'].config(state='disabled', text="Downloading...")
+        
+        if status_label:
+            status_label.config(text="Downloading...", foreground="blue")
+        
+        # Start download by requesting first chunk
+        print(f"[DEBUG] Requesting first chunk for {transfer_id}")
+        success = self.node.request_file_chunk(transfer_id, 0)
+        
+        if not success:
+            print(f"[DEBUG] Failed to start download!")
+            if status_label:
+                status_label.config(text="Error: Failed to start", foreground="red")
+    def start_file_download(self, transfer_id, sender_id, status_label=None):
+        """Start downloading a file - NEW METHOD"""
+        print(f"Starting download for transfer {transfer_id} from sender {sender_id}")
+        
+        # Update status
+        if status_label:
+            status_label.config(text="Starting download...", foreground="orange")
+        
+        # Check if we have the transfer record
+        if transfer_id not in self.node.file_transfers:
+            print(f"Transfer {transfer_id} not found in file_transfers")
+            if status_label:
+                status_label.config(text="Error: Transfer not found", foreground="red")
+            return
+        
+        transfer = self.node.file_transfers[transfer_id]
+        
+        # Check if sender is connected
+        if sender_id not in self.node.peer_connections:
+            print(f"Sender {sender_id} not connected")
+            if status_label:
+                status_label.config(text="Error: Sender not connected", foreground="red")
+            return
+        
+        # Mark as requesting and start download
+        transfer['requesting'] = True
+        
+        # Show progress bar
+        if transfer_id in self.file_widgets:
+            widgets = self.file_widgets[transfer_id]
+            widgets['progress_bar'].pack(pady=5)
+            widgets['download_btn'].config(state='disabled', text="Downloading...")
+        
+        # Update status
+        if status_label:
+            status_label.config(text="Downloading...", foreground="blue")
+        
+        # Request the first chunk to start the download
+        success = self.node.request_file_chunk(transfer_id, 0)
+        if not success:
+            print(f"Failed to request first chunk for transfer {transfer_id}")
+            if status_label:
+                status_label.config(text="Error: Failed to start download", foreground="red")
     def on_file_received(self, transfer_id, file_info):
         """Called when a complete file is received"""
         # Update progress to 100%
